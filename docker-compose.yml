@@ -1,47 +1,33 @@
 version: '3.8'
 
 services:
-  db:
-    image: pgvector/pgvector:pg16
-    container_name: legal_db
-    restart: always
-    environment:
-      POSTGRES_DB: legal_assistance
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: securepassword123
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
   backend:
     build:
       context: ./backend
-    container_name: legal_backend
+    container_name: legal_tantra_backend
     restart: always
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://postgres:securepassword123@db:5432/legal_assistance
-      - JWT_SECRET=supersecretjwtkeychangeinproduction2026
-      - ENCRYPTION_KEY=32byteslongsecretkeyforaesencryption
+      - DATABASE_URL=sqlite:///./legaltantra.db
       - ENVIRONMENT=development
-    depends_on:
-      - db
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     volumes:
       - ./backend:/app
-      - uploads_volume:/app/uploads
+      - backend_data:/app
 
   frontend:
     build:
       context: ./frontend
-    container_name: legal_frontend
+    container_name: legal_tantra_frontend
     restart: always
     ports:
       - "3000:3000"
+    environment:
+      - VITE_API_BASE=http://localhost:8000/api
     depends_on:
       - backend
 
 volumes:
-  postgres_data:
-  uploads_volume:
+  backend_data:

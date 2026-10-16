@@ -1,23 +1,83 @@
 import uuid
+import logging
+from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.config import (
+    RATE_LIMIT_ENABLED,
+    RATE_LIMIT_DEFAULT_LIMIT,
+    RATE_LIMIT_DEFAULT_WINDOW,
+    RATE_LIMIT_AI_LIMIT,
+    RATE_LIMIT_AI_WINDOW,
+    MAX_JSON_BODY_SIZE,
+    MAX_UPLOAD_SIZE,
+    ENVIRONMENT
+)
 from app.database import engine, Base, get_db
 from app.models import LegalProvision, IncidentSession, IncidentReport
+from app.schemas import (
+    ChatMessageRequest,
+    ChatResponse,
+    ResetChatRequest,
+    AnalyzeRequest,
+    AnalyzeResponse,
+    StatementEditRequest,
+    IncidentStatementResponse,
+    DocumentAnalysisResponse
+)
+from app.security import (
+    SecurityHeadersMiddleware,
+    RequestSizeLimitMiddleware,
+    InMemoryRateLimiter,
+    RateLimitMiddleware,
+    mask_pii,
+    sanitize_input_text,
+    neutralize_prompt_injection
+)
 from app.services.safety_service import EMERGENCY_CONTACTS
 from app.services.legal_service import seed_legal_provisions_if_empty
 from app.services.ai_service import generate_assistant_turn, generate_comprehensive_analysis
+from app.services.summary_service import generate_factual_incident_summary
 from app.services.doc_service import analyze_document_text
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("legal_tantra.main")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize database tables and seed verified provisions
+    Base.metadata.create_all(bind=engine)
+    db = next(get_db())
+    try:
+        seed_legal_provisions_if_empty(db)
+        logger.info("Database initialized and verified statutes seeded successfully.")
+    finally:
+        db.close()
+    yield
 
 app = FastAPI(
     title="Legal Tantra API",
-    description="AI-Powered Legal Awareness and Police Assistance Platform for India",
-    version="2.0.0"
+    description="AI-Assisted Legal Awareness and Incident Preparation Platform for India",
+    version="2.1.0",
+    lifespan=lifespan
 )
 
+# Initialize rate limiter
+rate_limiter = InMemoryRateLimiter(
+    default_limit=RATE_LIMIT_DEFAULT_LIMIT,
+    default_window=RATE_LIMIT_DEFAULT_WINDOW,
+    ai_limit=RATE_LIMIT_AI_LIMIT,
+    ai_window=RATE_LIMIT_AI_WINDOW,
+    enabled=RATE_LIMIT_ENABLED
+)
+app.state.rate_limiter = rate_limiter
+
+# Middlewares are added so that outer layers execute first on incoming requests:
+# Incoming: CORS -> SecurityHeaders -> RequestSizeLimit -> RateLimit -> Route handler
+# Outgoing: Route handler -> RateLimit -> RequestSizeLimit -> SecurityHeaders -> CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,47 +85,52 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware, max_json_size=MAX_JSON_BODY_SIZE, max_upload_size=MAX_UPLOAD_SIZE)
+app.add_middleware(RateLimitMiddleware, limiter=rate_limiter)
 
-@app.on_event("startup")
-def startup_event():
-    Base.metadata.create_all(bind=engine)
-    db = next(get_db())
-    try:
-        seed_legal_provisions_if_empty(db)
-    finally:
-        db.close()
-
-# Request / Response Schemas
-class ChatMessageRequest(BaseModel):
-    session_id: Optional[str] = None
-    message: str
-    language: str = "en"
-
-class AnalyzeRequest(BaseModel):
-    session_id: Optional[str] = None
-    facts: Optional[Dict[str, Any]] = None
-    language: str = "en"
-
-class StatementEditRequest(BaseModel):
-    user_edited_statement: str
-
-# Endpoints
+# =====================================================================
+# SYSTEM & HEALTH ENDPOINTS
+# =====================================================================
 @app.get("/api/health")
 def health_check():
     return {
         "status": "Operational",
         "service": "Legal Tantra API",
-        "database": "SQLite (Local Zero-Dependency)",
+        "version": "2.1.0",
+        "database": "SQLite (Zero-Dependency Local)",
+        "security": {
+            "rate_limiting": "Active (Sliding-Window)",
+            "headers": "OWASP Compliant (CSP, X-Frame-Options, Nosniff)",
+            "request_size_limits": f"JSON: {MAX_JSON_BODY_SIZE // 1024}KB, Upload: {MAX_UPLOAD_SIZE // (1024*1024)}MB",
+            "pii_logging": "Masked",
+            "prompt_injection_defense": "Active"
+        },
         "language_support": ["en", "te"],
-        "legal_sources": ["BNS 2023", "BNSS 2023", "BSA 2023", "IT Act 2000"]
+        "legal_sources": ["BNS 2023", "BNSS 2023", "BSA 2023", "IT Act 2000", "Consumer Protection Act 2019", "PWDVA 2005", "Specific Relief Act 1963"],
+        "compliance": "Pre-authority Citizen Factual Aid; Does not substitute licensed legal counsel"
     }
 
 @app.get("/api/emergency/contacts")
 def get_emergency_contacts():
     return {"emergency_contacts": EMERGENCY_CONTACTS}
 
+# =====================================================================
+# CHAT INTAKE & CONVERSATION
+# =====================================================================
 @app.post("/api/chat/message")
 def chat_message(req: ChatMessageRequest, db: Session = Depends(get_db)):
+    raw_message = req.message.strip()
+    if not raw_message:
+        raise HTTPException(status_code=400, detail="Message content cannot be empty.")
+
+    # Sanitize input and neutralize prompt injection attempts
+    sanitized = sanitize_input_text(raw_message)
+    secure_message = neutralize_prompt_injection(sanitized)
+
+    # Privacy-conscious logging (no raw PII logged)
+    logger.info(f"Citizen chat message received (Session: {req.session_id or 'new'}): {mask_pii(secure_message[:80])}...")
+
     session_id = req.session_id or str(uuid.uuid4())
     session_record = db.query(IncidentSession).filter(IncidentSession.session_id == session_id).first()
 
@@ -82,20 +147,20 @@ def chat_message(req: ChatMessageRequest, db: Session = Depends(get_db)):
 
     # Append user turn
     history = list(session_record.conversation_history or [])
-    history.append({"role": "user", "content": req.message})
+    history.append({"role": "user", "content": secure_message})
 
-    # AI Turn
+    # AI Turn (with hybrid deterministic fallback)
     ai_response = generate_assistant_turn(
         messages=history,
         language=req.language,
         db=db,
-        existing_facts=session_record.extracted_facts
+        existing_facts=session_record.extracted_facts or {}
     )
 
     # Append assistant turn
     history.append({"role": "assistant", "content": ai_response["reply"]})
 
-    # Update session
+    # Update session without logging PII
     session_record.conversation_history = history
     session_record.extracted_facts = ai_response["extracted_facts"]
     session_record.incident_category = ai_response["extracted_facts"].get("incident_type")
@@ -110,20 +175,25 @@ def chat_message(req: ChatMessageRequest, db: Session = Depends(get_db)):
         "reply": ai_response["reply"],
         "is_clarified": ai_response["is_clarified"],
         "safety_alert": ai_response["safety_alert"],
-        "safety_details": ai_response["safety_details"],
+        "safety_details": ai_response.get("safety_details"),
         "emotion_cue": ai_response["emotion_cue"],
         "extracted_facts": ai_response["extracted_facts"],
-        "missing_facts": ai_response["missing_facts"]
+        "missing_facts": ai_response["missing_facts"],
+        "suggested_next_step": ai_response.get("suggested_next_step"),
+        "jurisdiction_hint": ai_response.get("jurisdiction_hint", "uncertain")
     }
 
 @app.post("/api/chat/reset")
-def reset_chat_session(req: Dict[str, str], db: Session = Depends(get_db)):
-    session_id = req.get("session_id")
+def reset_chat_session(req: ResetChatRequest, db: Session = Depends(get_db)):
+    session_id = req.session_id
     if session_id:
         db.query(IncidentSession).filter(IncidentSession.session_id == session_id).delete()
         db.commit()
     return {"message": "Session reset successfully", "new_session_id": str(uuid.uuid4())}
 
+# =====================================================================
+# LEGAL ANALYSIS
+# =====================================================================
 @app.post("/api/incident/analyze")
 def analyze_incident(req: AnalyzeRequest, db: Session = Depends(get_db)):
     facts = req.facts
@@ -133,89 +203,35 @@ def analyze_incident(req: AnalyzeRequest, db: Session = Depends(get_db)):
             facts = session_record.extracted_facts
 
     if not facts:
-        facts = {"incident_type": "General Incident", "details": "Incident described by citizen"}
+        facts = {"incident_type": "Unspecified Incident", "details": "No facts recorded"}
 
     analysis = generate_comprehensive_analysis(facts, req.language, db)
     return analysis
 
+# =====================================================================
+# FACTUAL INCIDENT SUMMARY GENERATION (STRICTLY NON-FABRICATED)
+# =====================================================================
 @app.post("/api/incident/summary")
-def generate_police_summary(req: AnalyzeRequest, db: Session = Depends(get_db)):
+def generate_incident_summary(req: AnalyzeRequest, db: Session = Depends(get_db)):
     session_id = req.session_id or str(uuid.uuid4())
     facts = req.facts
-    
+
     if not facts and req.session_id:
         session_record = db.query(IncidentSession).filter(IncidentSession.session_id == req.session_id).first()
         if session_record:
             facts = session_record.extracted_facts
-            
+
     if not facts:
-        facts = {"incident_type": "Reported incident", "date_time": "Recent", "location": "Local area"}
+        facts = {"incident_type": "Reported incident", "date_time": "Not provided", "location": "Not provided"}
 
-    inc_type = facts.get("incident_type", "Offence")
-    dt = facts.get("date_time", "Date/Time as specified by complainant")
-    loc = facts.get("location", "Location as specified by complainant")
-    people = facts.get("people_involved", "Accused person(s)")
-    impact = facts.get("threat_injury_or_loss", "Threat, bodily hurt, or financial loss as detailed")
-    evidence = facts.get("evidence_available", "Digital communications / records enclosed")
-
-    statement = f"""================================================================================
-                    FACTUAL INCIDENT STATEMENT FOR POLICE STATION
-================================================================================
-(Prepared with Legal Tantra - Preliminary citizen factual aid)
-
-1. PURPOSE OF APPROACHING THE POLICE:
-I am approaching the police station to report an incident of {inc_type} and request prompt inquiry / registration of First Information Report (FIR) under relevant sections of the Bharatiya Nyaya Sanhita (BNS), 2023.
-
-2. DATE, TIME AND LOCATION:
-- Approximate Date & Time: {dt}
-- Location of Incident: {loc}
-
-3. PERSONS INVOLVED:
-{people}
-
-4. CHRONOLOGICAL SUMMARY OF EVENTS:
-On the date and time mentioned above at {loc}, the aforementioned individual(s) engaged in {inc_type}. The sequence of actions is stated as follows:
-- Specific actions: {impact}
-- No provocation was initiated by the complainant.
-
-5. INJURIES, THREATS OR FINANCIAL LOSS SUSTAINED:
-{impact}
-
-6. EVIDENCE AND WITNESSES:
-- Available Records / Digital Evidence: {evidence}
-- Preserved Communications: Phone records / transaction slips / messages available for inspection.
-(Subject to certificate under Section 63 of Bharatiya Sakshya Adhiniyam, 2023 where digital).
-
-7. SPECIFIC ASSISTANCE SOUGHT:
-I respectfully request the Station House Officer (SHO) to:
-(a) Acknowledge receipt and register this complaint.
-(b) Issue a free signed copy of the First Information Report (FIR) in accordance with Section 173 of the Bharatiya Nagarik Suraksha Sanhita (BNSS), 2023.
-(c) Take appropriate legal steps to investigate the matter and safeguard the complainant.
-
---------------------------------------------------------------------------------
-Signature of Complainant: ____________________
-Date: ____________________
-Phone: ____________________
-================================================================================
-Disclaimer: This document is a factual preparation aid drafted from the citizen's own statements. Final legal classification is determined by the police and court of competent jurisdiction.
-"""
+    summary_data = generate_factual_incident_summary(facts, req.language)
 
     report_record = IncidentReport(
         session_id=session_id,
-        statement_text=statement.strip(),
-        user_edited_statement=statement.strip(),
-        evidence_checklist=[
-            {"item": "Physical or print copy of this statement", "checked": True},
-            {"item": "Government identity proof (Aadhaar / Voter ID / Driving License)", "checked": True},
-            {"item": "Phone with original text messages / WhatsApp chats preserved", "checked": True},
-            {"item": "Medical prescription / injury slip (if physical assault)", "checked": False},
-            {"item": "Bank account statement / UPI reference number (if financial fraud)", "checked": False}
-        ],
-        recommended_questions=[
-            "May I please receive the FIR number and a signed copy under Section 173 BNSS?",
-            "Who is the designated Investigating Officer (IO) assigned to this matter?",
-            "Can I get a formal written acknowledgment seal on the duplicate copy of my complaint?"
-        ]
+        statement_text=summary_data["statement_text"],
+        user_edited_statement=summary_data["statement_text"],
+        evidence_checklist=summary_data["evidence_checklist"],
+        recommended_questions=summary_data["recommended_questions"]
     )
     db.add(report_record)
     db.commit()
@@ -224,57 +240,74 @@ Disclaimer: This document is a factual preparation aid drafted from the citizen'
     return {
         "report_id": report_record.id,
         "session_id": session_id,
+        "target_authority": summary_data["target_authority"],
         "statement_text": report_record.statement_text,
         "evidence_checklist": report_record.evidence_checklist,
-        "recommended_questions": report_record.recommended_questions
+        "recommended_questions": report_record.recommended_questions,
+        "verification_checklist": summary_data["verification_checklist"]
     }
 
 @app.put("/api/incident/summary/{report_id}")
-def update_police_summary(report_id: str, req: StatementEditRequest, db: Session = Depends(get_db)):
+def update_incident_summary(report_id: str, req: StatementEditRequest, db: Session = Depends(get_db)):
     report_record = db.query(IncidentReport).filter(IncidentReport.id == report_id).first()
     if not report_record:
         raise HTTPException(status_code=404, detail="Incident report not found")
-    report_record.user_edited_statement = req.user_edited_statement
+    sanitized_text = sanitize_input_text(req.user_edited_statement)
+    report_record.user_edited_statement = sanitized_text
     db.commit()
     return {"message": "Statement updated successfully", "statement_text": report_record.user_edited_statement}
 
+# =====================================================================
+# LEGAL KNOWLEDGE LIBRARY
+# =====================================================================
 @app.get("/api/legal/library")
 def get_legal_library(category: Optional[str] = None, db: Session = Depends(get_db)):
     q = db.query(LegalProvision)
-    if category:
-        q = q.filter(LegalProvision.category == category)
+    if category and category != "All":
+        safe_cat = sanitize_input_text(category)
+        q = q.filter(LegalProvision.category.ilike(f"%{safe_cat}%"))
     provisions = q.all()
     return {"provisions": provisions}
 
 @app.get("/api/legal/search")
-def search_legal_library(q: str, db: Session = Depends(get_db)):
-    term = f"%{q.lower()}%"
-    results = db.query(LegalProvision).filter(
-        (LegalProvision.act.ilike(term)) |
-        (LegalProvision.section_number.ilike(term)) |
-        (LegalProvision.title.ilike(term)) |
-        (LegalProvision.plain_explanation.ilike(term))
+def search_legal_library(q: str = Query(..., min_length=1), db: Session = Depends(get_db)):
+    clean_q = sanitize_input_text(q).strip()
+    if not clean_q:
+        raise HTTPException(status_code=400, detail="Search query cannot be empty.")
+    search_term = f"%{clean_q}%"
+    provisions = db.query(LegalProvision).filter(
+        (LegalProvision.title.ilike(search_term)) |
+        (LegalProvision.act.ilike(search_term)) |
+        (LegalProvision.section_number.ilike(search_term)) |
+        (LegalProvision.plain_explanation.ilike(search_term))
     ).all()
-    return {"query": q, "results": results}
+    return {"query": clean_q, "results": provisions}
 
+# =====================================================================
+# DOCUMENT ANALYZER
+# =====================================================================
 @app.post("/api/document/analyze")
 async def analyze_document(
     file: Optional[UploadFile] = File(None),
-    raw_text: Optional[str] = Form(None)
+    text_content: Optional[str] = Form(None)
 ):
     content = ""
-    filename = "Pasted Legal Text"
+    filename = "Pasted text"
     if file:
-        filename = file.filename
-        bytes_content = await file.read()
-        try:
-            content = bytes_content.decode("utf-8")
-        except UnicodeDecodeError:
-            content = f"Uploaded document: {filename}. Content contains legal notice references, dates, and statutory requirements."
-    elif raw_text:
-        content = raw_text
-    else:
-        raise HTTPException(status_code=400, detail="Please upload a document file or paste legal text.")
+        filename = sanitize_input_text(file.filename or "Uploaded document")
+        bytes_data = await file.read()
+        if len(bytes_data) > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Uploaded file exceeds maximum limit of {MAX_UPLOAD_SIZE // (1024*1024)} MB."
+            )
+        content = bytes_data.decode("utf-8", errors="ignore")
+    elif text_content:
+        content = text_content
 
-    analysis = analyze_document_text(content, filename)
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="No document file or text content provided for analysis.")
+
+    sanitized_content = sanitize_input_text(content)
+    analysis = analyze_document_text(sanitized_content, filename)
     return analysis

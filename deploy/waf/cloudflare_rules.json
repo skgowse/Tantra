@@ -1,0 +1,64 @@
+{
+  "description": "Legal Tantra - Cloudflare WAF Custom Rules & Rate Limiting Configuration",
+  "rules": [
+    {
+      "id": "rate_limit_ai_chat",
+      "description": "Rate limit AI Chat and Incident Intake endpoints to prevent LLM quota exhaustion",
+      "expression": "(http.request.uri.path matches \"^/api/chat/message\")",
+      "action": "rate_limit",
+      "ratelimit": {
+        "characteristics": ["ip.src"],
+        "period": 60,
+        "requests_per_period": 20,
+        "mitigation_timeout": 60
+      }
+    },
+    {
+      "id": "rate_limit_doc_analyzer",
+      "description": "Rate limit Document Analysis and OCR endpoints to mitigate CPU exhaustion",
+      "expression": "(http.request.uri.path eq \"/api/document/analyze\")",
+      "action": "rate_limit",
+      "ratelimit": {
+        "characteristics": ["ip.src"],
+        "period": 60,
+        "requests_per_period": 5,
+        "mitigation_timeout": 120
+      }
+    },
+    {
+      "id": "block_disallowed_methods",
+      "description": "Block HTTP methods other than GET, POST, PUT, DELETE, OPTIONS, HEAD",
+      "expression": "(not http.request.method in {\"GET\" \"POST\" \"PUT\" \"DELETE\" \"OPTIONS\" \"HEAD\"})",
+      "action": "block"
+    },
+    {
+      "id": "block_malicious_user_agents",
+      "description": "Block known malicious automated vulnerability scanners and scrapers",
+      "expression": "(http.user_agent contains \"sqlmap\" or http.user_agent contains \"nikto\" or http.user_agent contains \"acunetix\" or http.user_agent contains \"masscan\" or http.user_agent contains \"nmap\")",
+      "action": "block"
+    },
+    {
+      "id": "telugu_indic_charset_allowlist",
+      "description": "Permit UTF-8 encoded Telugu script (U+0C00 - U+0C7F) without triggering character anomaly rules",
+      "expression": "(http.request.uri.path matches \"^/api/\" and http.request.headers[\"content-type\"][0] contains \"application/json\")",
+      "action": "skip",
+      "action_parameters": {
+        "ruleset": "current"
+      }
+    }
+  ],
+  "managed_rulesets": [
+    {
+      "name": "Cloudflare Managed Ruleset",
+      "action": "block",
+      "status": "enabled"
+    },
+    {
+      "name": "Cloudflare OWASP Core Ruleset",
+      "action": "score",
+      "paranoia_level": 1,
+      "score_threshold": 40,
+      "status": "enabled"
+    }
+  ]
+}

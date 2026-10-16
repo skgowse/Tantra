@@ -8,7 +8,7 @@ import {
   Menu, X, ChevronRight, Layers, Check, ArrowUpRight, Home
 } from 'lucide-react'
 
-const API_BASE = 'http://localhost:8000/api'
+const API_BASE = (import.meta as any).env?.VITE_API_BASE || 'http://localhost:8000/api'
 
 // Bilingual Dictionary
 const I18N = {
@@ -432,24 +432,24 @@ I am approaching the police station to report an incident of ${extractedFacts.in
 ${extractedFacts.people_involved || "Individual named in report"}
 
 4. CHRONOLOGICAL SUMMARY OF EVENTS:
-On the date and time mentioned above, the aforementioned person(s) subjected the complainant to ${extractedFacts.incident_type || "threats"}. 
-- Specific actions: Words or gestures creating fear of harm.
-- No provocation was initiated by the complainant.
+On the date and time mentioned above, the complainant reports the following events involving ${extractedFacts.incident_type || "the reported situation"}:
+- Narrative as reported by complainant: ${extractedFacts.alleged_actions || "Details stated during consultation"}
 
-5. INJURIES, THREATS OR FINANCIAL LOSS SUSTAINED:
-${extractedFacts.threat_injury_or_loss || "Threat of injury communicated"}
+5. REPORTED INJURIES, HARM OR FINANCIAL LOSS:
+${extractedFacts.threat_injury_or_loss || extractedFacts.injuries_or_loss || "None reported or not provided"}
 
-6. EVIDENCE AND WITNESSES:
-- Available Records / Digital Evidence: ${extractedFacts.evidence_available || "Call records / messages available"}
+6. EVIDENCE AND WITNESSES (AS CITED):
+- Available Records / Digital Evidence: ${extractedFacts.evidence_available || extractedFacts.evidence_mentioned || "Not specified at this time"}
 
-7. SPECIFIC ASSISTANCE SOUGHT:
-I respectfully request the Station House Officer (SHO) to:
-(a) Acknowledge receipt and register this complaint.
-(b) Issue a free signed copy of the First Information Report (FIR) in accordance with Section 173 of the Bharatiya Nagarik Suraksha Sanhita (BNSS), 2023.
-(c) Initiate inquiry and ensure complainant's safety.
+7. ASSISTANCE SOUGHT:
+The complainant respectfully requests the competent authority to:
+(a) Receive and formally acknowledge receipt of this factual summary.
+(b) Review the stated facts in accordance with applicable legal procedure.
+(c) Issue an official acknowledgment or reference code for tracking.
 
 --------------------------------------------------------------------------------
-Signature of Complainant: ____________________
+Signature of Complainant / Citizen: ____________________
+Full Name: ____________________
 Date: ____________________
 `
       setPoliceStatement(mockStatement)
